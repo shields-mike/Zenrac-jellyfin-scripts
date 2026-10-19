@@ -1,6 +1,12 @@
-
 /*
     Replaces the search suggestions section on the search page with cards instead of links.
+
+    Modified for Jellyfin 12:
+      - Falls back to fetching suggestions itself, so cards also appear on a full page refresh
+      - Uses the public ApiClient.getCurrentUserId() instead of a private field
+      - Keeps imageTypeLimit instead of deleting it
+      - Applies data-src to cards manually (lazy loader does not pick up injected cards)
+      - Errors are caught and logged instead of leaving the section hidden
 */
 
 const script = document.currentScript;
@@ -8,23 +14,27 @@ const ITEMS_COUNT = script?.dataset.itemsCount ? parseInt(script?.dataset.itemsC
 const HORIZONTAL_SCROLL = script?.dataset.horizontalScroll === "true";
 
 function getUserId() {
-    const id = window.ApiClient?._currentUser?.Id || null;
-    return id;
+    try {
+        return window.ApiClient?.getCurrentUserId?.() || window.ApiClient?._currentUser?.Id || null;
+    } catch {
+        return null;
+    }
+}
+
+function isSearchPage() {
+    return location.hash.startsWith('#/search');
 }
 
 (function injectCSS() {
     const style = document.createElement('style');
     style.textContent = `
         .verticalSection.searchSuggestions {
-        visibility: hidden;
-        animation: ssReveal 0s linear 3s forwards;
+            visibility: hidden;
+            animation: ssReveal 0s linear 3s forwards;
         }
         @keyframes ssReveal { to { visibility: visible; } }
         .verticalSection.searchSuggestions:has(.custom-scroller) {
             visibility: visible;
-        }
-        .verticalSection.searchSuggestions .sectionTitleContainer {
-            padding-left: 0px !important;
         }
         ${!HORIZONTAL_SCROLL ? `
         .verticalSection.searchSuggestions .itemsContainer {
@@ -39,23 +49,29 @@ function getUserId() {
 })();
 
 
+// ---- Path 1: catch the page's own suggestions request (works on in-app navigation) ----
+
 const originalOpen = XMLHttpRequest.prototype.open;
 const originalSend = XMLHttpRequest.prototype.send;
 
-XMLHttpRequest.prototype.open = function(method, url, ...args) {
+function isSuggestionsUrl(url) {
     const userId = getUserId();
-    if (
+    return Boolean(
         userId &&
         typeof url === 'string' &&
         url.includes('/Items') &&
         url.includes(`userId=${userId}`) &&
-        location.hash.startsWith('#/search') &&
+        isSearchPage() &&
         !url.includes('searchTerm=')
-    ) {
+    );
+}
+
+XMLHttpRequest.prototype.open = function(method, url, ...args) {
+    if (isSuggestionsUrl(url)) {
         const u = new URL(url, location.origin);
         u.searchParams.set('enableImages', 'true');
         u.searchParams.set('limit', ITEMS_COUNT.toString());
-        u.searchParams.delete('imageTypeLimit');
+        u.searchParams.set('imageTypeLimit', '1');
         url = u.toString();
     }
     this.__url = url;
@@ -64,37 +80,61 @@ XMLHttpRequest.prototype.open = function(method, url, ...args) {
 
 XMLHttpRequest.prototype.send = function(...args) {
     this.addEventListener('load', () => {
-        const userId = getUserId();
-        if (!userId) return;
+        if (!isSuggestionsUrl(this.__url)) return;
 
-        if (
-            this.__url &&
-            this.__url.includes('/Items') &&
-            this.__url.includes(`userId=${userId}`) &&
-            location.hash.startsWith('#/search') &&
-            !this.__url.includes('searchTerm=')
-        ) {
-            let payload;
-            try {
-                payload = JSON.parse(this.responseText);
-            } catch {
-                payload = this.responseText;
-            }
-            startWatchingSuggestions(payload.Items || []);
+        let payload;
+        try {
+            payload = JSON.parse(this.responseText);
+        } catch {
+            return;
         }
+        cachedItems = payload?.Items || [];
+        ensureCards();
     });
 
     return originalSend.apply(this, args);
 };
 
+
+// ---- Rendering ----
+
+let cachedItems = null;
+let busy = false;
+let pollTimer = null;
+
 function isAlreadyReplaced(parent) {
-    const exists = parent.querySelector('.custom-scroller');
-    return exists;
+    return parent.querySelector('.custom-scroller');
 }
 
 function needsReplacement(parent) {
-    const needed = !isAlreadyReplaced(parent) && parent.querySelector('a, button');
-    return needed;
+    return !isAlreadyReplaced(parent) && parent.querySelector('a, button');
+}
+
+function waitForCardBuilder(timeout = 5000, interval = 50) {
+    return new Promise((resolve, reject) => {
+        const start = Date.now();
+
+        const check = () => {
+            if (window.cardBuilder) return resolve();
+            if (Date.now() - start > timeout) return reject(new Error('window.cardBuilder not available'));
+            setTimeout(check, interval);
+        };
+
+        check();
+    });
+}
+
+function loadCardImages(root) {
+    root.querySelectorAll('[data-src]').forEach(el => {
+        const src = el.getAttribute('data-src');
+        if (!src) return;
+        if (el.tagName === 'IMG') {
+            el.src = src;
+        } else {
+            el.style.backgroundImage = `url("${src}")`;
+        }
+        el.removeAttribute('data-src');
+    });
 }
 
 async function replaceSuggestionContainer(items) {
@@ -115,16 +155,7 @@ async function replaceSuggestionContainer(items) {
         );
 
         parent.appendChild(section);
-
-        section.querySelectorAll('[data-src]').forEach(el => {
-        const src = el.getAttribute('data-src');
-        if (el.tagName === 'IMG') {
-            el.src = src;
-        } else {
-            el.style.backgroundImage = `url("${src}")`;
-        }
-        el.removeAttribute('data-src');
-    });
+        loadCardImages(section);
 
         if (!HORIZONTAL_SCROLL) {
             const itemsContainer = parent.querySelector('.itemsContainer');
@@ -135,36 +166,56 @@ async function replaceSuggestionContainer(items) {
     }
 }
 
-let suggestionObserver = null;
 
-function startWatchingSuggestions(items) {
-    if (suggestionObserver) return;
+// ---- Path 2: fetch suggestions ourselves (covers full page refresh and cached responses) ----
 
-    suggestionObserver = new MutationObserver((mutations, obs) => {
-        const sections = document.querySelectorAll('.verticalSection.searchSuggestions');
-        if (sections.length > 0) {
-            replaceSuggestionContainer(items);
-            obs.disconnect();
-            suggestionObserver = null;
-        }
+async function fetchItems() {
+    const userId = getUserId();
+    if (!userId || !window.ApiClient?.getItems) return [];
+
+    const result = await window.ApiClient.getItems(userId, {
+        limit: ITEMS_COUNT,
+        recursive: true,
+        sortBy: 'IsFavoriteOrLiked,Random',
+        includeItemTypes: 'Movie,Series',
+        enableImages: true,
+        enableImageTypes: 'Primary',
+        imageTypeLimit: 1,
+        enableUserData: true,
+        fields: 'PrimaryImageAspectRatio'
     });
-
-    suggestionObserver.observe(document.body, {
-        childList: true,
-        subtree: true
-    });
+    return result?.Items || [];
 }
 
-function waitForCardBuilder(timeout = 5000, interval = 50) {
-    return new Promise((resolve, reject) => {
-        const start = Date.now();
+async function ensureCards() {
+    if (busy || !isSearchPage()) return;
 
-        const check = () => {
-            if (window.cardBuilder) return resolve();
-            if (Date.now() - start > timeout) return reject('window.cardBuilder not available');
-            setTimeout(check, interval);
-        };
+    const section = document.querySelector('.verticalSection.searchSuggestions');
+    if (!section || !needsReplacement(section)) return;
 
-        check();
-    });
+    busy = true;
+    try {
+        const items = cachedItems?.length ? cachedItems : await fetchItems();
+        await replaceSuggestionContainer(items);
+    } catch (e) {
+        console.warn('[search-cards] failed to build suggestion cards:', e);
+    } finally {
+        busy = false;
+    }
 }
+
+function startPolling() {
+    clearInterval(pollTimer);
+    let tries = 0;
+    pollTimer = setInterval(() => {
+        ensureCards();
+        if (++tries >= 40) clearInterval(pollTimer);
+    }, 500);
+}
+
+window.addEventListener('hashchange', () => {
+    cachedItems = null;
+    if (isSearchPage()) startPolling();
+});
+
+if (isSearchPage()) startPolling();
