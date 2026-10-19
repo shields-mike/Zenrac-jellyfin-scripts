@@ -116,6 +116,16 @@ async function replaceSuggestionContainer(items) {
 
         parent.appendChild(section);
 
+        section.querySelectorAll('[data-src]').forEach(el => {
+        const src = el.getAttribute('data-src');
+        if (el.tagName === 'IMG') {
+            el.src = src;
+        } else {
+            el.style.backgroundImage = `url("${src}")`;
+        }
+        el.removeAttribute('data-src');
+    });
+
         if (!HORIZONTAL_SCROLL) {
             const itemsContainer = parent.querySelector('.itemsContainer');
             if (itemsContainer) {
