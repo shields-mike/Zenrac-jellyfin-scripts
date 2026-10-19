@@ -16,13 +16,15 @@ function getUserId() {
     const style = document.createElement('style');
     style.textContent = `
         .verticalSection.searchSuggestions {
-            visibility: hidden;
+        visibility: hidden;
+        animation: ssReveal 0s linear 3s forwards;
         }
+        @keyframes ssReveal { to { visibility: visible; } }
         .verticalSection.searchSuggestions:has(.custom-scroller) {
             visibility: visible;
         }
         .verticalSection.searchSuggestions .sectionTitleContainer {
-            padding-left: 0px; !important;
+            padding-left: 0px !important;
         }
         ${!HORIZONTAL_SCROLL ? `
         .verticalSection.searchSuggestions .itemsContainer {
